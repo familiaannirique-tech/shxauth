@@ -43,12 +43,19 @@ app.use(bodyParser.json());
    DATABASE (JSON simples em disco)
 ═══════════════════════════════════ */
 function loadDB() {
+  const def = { keys: { Diario: [], Semanal: [], Mensal: [], Vitalicio: [] }, active: [] };
   if (!fs.existsSync(DB_FILE)) {
-    const empty = { keys: [], active: [] };
-    fs.writeFileSync(DB_FILE, JSON.stringify(empty, null, 2));
-    return empty;
+    fs.writeFileSync(DB_FILE, JSON.stringify(def, null, 2));
+    return def;
   }
-  return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+  const db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+  if (!db.keys || Array.isArray(db.keys)) db.keys = def.keys;
+  if (!db.keys.Diario)    db.keys.Diario    = [];
+  if (!db.keys.Semanal)   db.keys.Semanal   = [];
+  if (!db.keys.Mensal)    db.keys.Mensal    = [];
+  if (!db.keys.Vitalicio) db.keys.Vitalicio = [];
+  if (!db.active) db.active = [];
+  return db;
 }
 
 function saveDB(db) {
