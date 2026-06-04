@@ -31,7 +31,12 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'admin-secret-mude-isso';
 const DB_FILE      = path.join(__dirname, 'db.json');
 
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET','POST','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','X-Admin-Secret']
+}));
+app.options('*', cors());
 app.use(bodyParser.json());
 
 /* ═══════════════════════════════════
@@ -273,6 +278,22 @@ app.delete('/api/keys/:id', requireAdmin, (req, res) => {
   db.active.splice(idx, 1);
   saveDB(db);
   return res.json({ success: true, message: 'key_deleted' });
+});
+
+/* ═══════════════════════════════════
+   ROTA: POST /api/add-time  [ADMIN]
+═══════════════════════════════════ */
+app.post('/api/add-time', requireAdmin, (req, res) => {
+  const { id, amt, unit } = req.body;
+  if (!id || !amt) return res.status(400).json({ success: false, message: 'id e amt obrigatórios' });
+  const db  = loadDB();
+  const rec = (db.active || []).find(a => a.id === id);
+  if (!rec) return res.json({ success: false, message: 'key não encontrada' });
+  if (rec.plan === 'Vitalicio') return res.json({ success: false, message: 'key vitalícia' });
+  const ms = unit === 'hour' ? amt * 3600000 : amt * 86400000;
+  rec.expiresAt = Math.max(Date.now(), rec.expiresAt || Date.now()) + ms;
+  saveDB(db);
+  return res.json({ success: true, message: 'time_added', expiresAt: rec.expiresAt });
 });
 
 /* ═══════════════════════════════════
