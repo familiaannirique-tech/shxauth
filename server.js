@@ -303,6 +303,33 @@ app.post('/api/add-time', requireAdmin, (req, res) => {
   return res.json({ success: true, message: 'time_added', expiresAt: rec.expiresAt });
 });
 
+/* ═══════════════════════════════════════
+   ROTA: DELETE /api/keys/pending/:plan  [ADMIN]
+═══════════════════════════════════════ */
+app.delete('/api/keys/pending/:plan', requireAdmin, (req, res) => {
+  const db = loadDB();
+  const valid = ['Diario','Semanal','Mensal','Vitalicio'];
+  if (!valid.includes(req.params.plan))
+    return res.status(400).json({ success: false, message: 'plano inválido' });
+  db.keys[req.params.plan] = [];
+  saveDB(db);
+  return res.json({ success: true, message: 'keys_cleared' });
+});
+
+/* ═══════════════════════════════════════
+   ROTA: DELETE /api/keys/pending/:plan/:id  [ADMIN]
+═══════════════════════════════════════ */
+app.delete('/api/keys/pending/:plan/:id', requireAdmin, (req, res) => {
+  const db = loadDB();
+  const valid = ['Diario','Semanal','Mensal','Vitalicio'];
+  if (!valid.includes(req.params.plan))
+    return res.status(400).json({ success: false, message: 'plano inválido' });
+  const before = db.keys[req.params.plan].length;
+  db.keys[req.params.plan] = db.keys[req.params.plan].filter(k => k.id !== req.params.id);
+  saveDB(db);
+  return res.json({ success: true, removed: before - db.keys[req.params.plan].length });
+});
+
 /* ═══════════════════════════════════
    ROTA: GET /api/health
 ═══════════════════════════════════ */
@@ -322,5 +349,7 @@ app.listen(PORT, () => {
   console.log(`    POST   /api/reset-hwid  [admin]`);
   console.log(`    POST   /api/generate    [admin]`);
   console.log(`    GET    /api/keys        [admin]`);
-  console.log(`    DELETE /api/keys/:id    [admin]\n`);
+  console.log(`    DELETE /api/keys/:id    [admin]`);
+  console.log(`    DELETE /api/keys/pending/:plan      [admin]`);
+  console.log(`    DELETE /api/keys/pending/:plan/:id  [admin]\n`);
 });
