@@ -1,35 +1,42 @@
-/**
+/***
  * KEY AUTH — API de Licenças
- * Node.js + Express
+ * Node.js + Express + MongoDB Atlas
  *
  * Endpoints:
- *   POST /api/activate   → ativa uma key (vincula HWID)
- *   POST /api/verify     → verifica se a key + HWID são válidos
- *   POST /api/reset-hwid → reseta o HWID de uma key (admin)
- *   GET  /api/keys       → lista todas as keys (admin)
- *   POST /api/generate   → gera novas keys (admin)
- *   DELETE /api/keys/:id → revoga uma key (admin)
+ *   POST   /api/activate              → ativa uma key (vincula HWID)
+ *   POST   /api/verify                → verifica se a key + HWID são válidos
+ *   POST   /api/reset-hwid            → reseta o HWID de uma key (admin)
+ *   GET    /api/keys                  → lista todas as keys (admin)
+ *   POST   /api/generate              → gera novas keys (admin)
+ *   DELETE /api/keys/:id              → revoga uma key ativa (admin)
+ *   POST   /api/add-time              → adiciona tempo a uma key (admin)
+ *   DELETE /api/keys/pending/:plan    → limpa keys pendentes de um plano (admin)
+ *   DELETE /api/keys/pending/:plan/:id→ remove key pendente específica (admin)
+ *   GET    /api/health                → health check
  *
- * Headers obrigatórios (rotas admin):
- *   X-Admin-Secret: <ADMIN_SECRET>
- *
- * Instalar:  npm install
- * Iniciar:   node server.js
+ * Variáveis de ambiente no Render:
+ *   MONGODB_URI   → connection string do MongoDB Atlas
+ *   ADMIN_SECRET  → senha admin do painel
+ *   PORT          → (opcional) porta, padrão 3000
  */
 
 const express    = require('express');
 const cors       = require('cors');
 const bodyParser = require('body-parser');
 const crypto     = require('crypto');
-const fs         = require('fs');
-const path       = require('path');
+const { MongoClient } = require('mongodb');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
 /* ─── CONFIG ─── */
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'admin-secret-mude-isso';
-const DB_FILE      = path.join(__dirname, 'db.json');
+const ADMIN_SECRET  = process.env.ADMIN_SECRET  || 'ADMIN_SECRET';
+const MONGODB_URI   = process.env.MONGODB_URI   || '';
+
+if (!MONGODB_URI) {
+  console.error('ERRO: variável MONGODB_URI não definida!');
+  process.exit(1);
+}
 
 app.use(cors({
   origin: '*',
@@ -40,27 +47,19 @@ app.options('*', cors());
 app.use(bodyParser.json());
 
 /* ═══════════════════════════════════
-   DATABASE (JSON simples em disco)
+   MONGODB
 ═══════════════════════════════════ */
-function loadDB() {
-  const def = { keys: { Diario: [], Semanal: [], Mensal: [], Vitalicio: [] }, active: [] };
-  if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(def, null, 2));
-    return def;
-  }
-  const db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  if (!db.keys || Array.isArray(db.keys)) db.keys = def.keys;
-  if (!db.keys.Diario)    db.keys.Diario    = [];
-  if (!db.keys.Semanal)   db.keys.Semanal   = [];
-  if (!db.keys.Mensal)    db.keys.Mensal    = [];
-  if (!db.keys.Vitalicio) db.keys.Vitalicio = [];
-  if (!db.active) db.active = [];
-  return db;
+let db;
+
+async function connectDB() {
+  const client = new MongoClient(MONGODB_URI);
+  await client.connect();
+  db = client.db('keyauth');
+  console.log('✅ MongoDB conectado');
 }
 
-function saveDB(db) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-}
+function keys()   { return db.collection('keys');   }  // keys pendentes: { plan, id, code }
+function active() { return db.collection('active'); }  // keys ativas
 
 /* ═══════════════════════════════════
    UTILS
@@ -73,17 +72,16 @@ function generateKeyCode(prefix) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   let s = '';
   for (let i = 0; i < 16; i++) s += chars[Math.floor(Math.random() * chars.length)];
-  // format: PREFIX-XXXX-XXXX-XXXX-XXXX
   const p = (prefix || 'KEY').toUpperCase().slice(0, 6);
   return `${p}-${s.slice(0,4)}-${s.slice(4,8)}-${s.slice(8,12)}-${s.slice(12,16)}`;
 }
 
 function planDurationMs(plan) {
   switch (plan) {
-    case 'Diario':    return 1 * 24 * 3600 * 1000;
-    case 'Semanal':   return 7 * 24 * 3600 * 1000;
+    case 'Diario':    return 1  * 24 * 3600 * 1000;
+    case 'Semanal':   return 7  * 24 * 3600 * 1000;
     case 'Mensal':    return 30 * 24 * 3600 * 1000;
-    case 'Vitalicio': return null; // sem expiração
+    case 'Vitalicio': return null;
     default:          return null;
   }
 }
@@ -103,68 +101,48 @@ function getClientIP(req) {
 
 /* ═══════════════════════════════════
    ROTA: POST /api/activate
-   Ativa uma key e vincula o HWID
 ═══════════════════════════════════ */
-app.post('/api/activate', (req, res) => {
+app.post('/api/activate', async (req, res) => {
   const { key, hwid } = req.body;
-
-  if (!key || !hwid) {
+  if (!key || !hwid)
     return res.status(400).json({ success: false, message: 'key e hwid são obrigatórios' });
-  }
 
-  const db     = loadDB();
   const keyUp  = key.toUpperCase().trim();
   const hwidTr = hwid.trim();
 
-  // Checar se já está ativa (key já vinculada)
-  const alreadyActive = db.active.find(a => a.code === keyUp);
+  // Já está ativa?
+  const alreadyActive = await active().findOne({ code: keyUp });
   if (alreadyActive) {
-    // Mesmo HWID → retorna sucesso (re-login)
     if (alreadyActive.hwid === hwidTr) {
       const expired = alreadyActive.plan !== 'Vitalicio' && alreadyActive.expiresAt < Date.now();
-      if (expired) {
+      if (expired)
         return res.json({ success: false, message: 'key_expired', plan: alreadyActive.plan });
-      }
-      return res.json({
-        success:   true,
-        message:   'already_active',
-        plan:      alreadyActive.plan,
-        expiresAt: alreadyActive.expiresAt || null
-      });
+      return res.json({ success: true, message: 'already_active', plan: alreadyActive.plan, expiresAt: alreadyActive.expiresAt || null });
     }
-    // HWID diferente e não foi resetado
-    if (alreadyActive.hwid !== null) {
+    if (alreadyActive.hwid !== null)
       return res.json({ success: false, message: 'hwid_mismatch' });
-    }
-    // HWID foi resetado (null) → vincular novo HWID
-    alreadyActive.hwid      = hwidTr;
-    alreadyActive.resetAt   = null;
-    alreadyActive.ip        = getClientIP(req);
-    saveDB(db);
-    return res.json({
-      success:   true,
-      message:   'hwid_rebound',
-      plan:      alreadyActive.plan,
-      expiresAt: alreadyActive.expiresAt || null
-    });
+
+    // HWID foi resetado → vincular novo
+    await active().updateOne({ code: keyUp }, { $set: { hwid: hwidTr, resetAt: null, ip: getClientIP(req) } });
+    return res.json({ success: true, message: 'hwid_rebound', plan: alreadyActive.plan, expiresAt: alreadyActive.expiresAt || null });
   }
 
   // Procurar key pendente
+  const plans = ['Diario','Semanal','Mensal','Vitalicio'];
+  let foundKey = null;
   let foundPlan = null;
-  let foundKey  = null;
-  for (const plan of ['Diario','Semanal','Mensal','Vitalicio']) {
-    const idx = (db.keys[plan] || []).findIndex(k => k.code === keyUp);
-    if (idx !== -1) {
+
+  for (const plan of plans) {
+    foundKey = await keys().findOne({ plan, code: keyUp });
+    if (foundKey) {
       foundPlan = plan;
-      foundKey  = db.keys[plan][idx];
-      db.keys[plan].splice(idx, 1);
+      await keys().deleteOne({ _id: foundKey._id });
       break;
     }
   }
 
-  if (!foundKey) {
+  if (!foundKey)
     return res.json({ success: false, message: 'invalid_key' });
-  }
 
   const durMs     = planDurationMs(foundPlan);
   const expiresAt = durMs ? Date.now() + durMs : null;
@@ -181,153 +159,139 @@ app.post('/api/activate', (req, res) => {
     resetAt:     null
   };
 
-  db.active.push(record);
-  saveDB(db);
+  await active().insertOne(record);
 
-  return res.json({
-    success:   true,
-    message:   'activated',
-    plan:      foundPlan,
-    expiresAt: expiresAt || null
-  });
+  return res.json({ success: true, message: 'activated', plan: foundPlan, expiresAt: expiresAt || null });
 });
 
 /* ═══════════════════════════════════
    ROTA: POST /api/verify
-   Verifica key + HWID a cada boot
 ═══════════════════════════════════ */
-app.post('/api/verify', (req, res) => {
+app.post('/api/verify', async (req, res) => {
   const { key, hwid } = req.body;
-
-  if (!key || !hwid) {
+  if (!key || !hwid)
     return res.status(400).json({ success: false, message: 'key e hwid são obrigatórios' });
-  }
 
-  const db    = loadDB();
   const keyUp = key.toUpperCase().trim();
-  const rec   = db.active.find(a => a.code === keyUp);
+  const rec   = await active().findOne({ code: keyUp });
 
-  if (!rec) {
+  if (!rec)
     return res.json({ success: false, message: 'invalid_key' });
-  }
-
-  if (rec.hwid !== hwid.trim()) {
+  if (rec.hwid !== hwid.trim())
     return res.json({ success: false, message: 'hwid_mismatch' });
-  }
-
-  if (rec.plan !== 'Vitalicio' && rec.expiresAt < Date.now()) {
+  if (rec.plan !== 'Vitalicio' && rec.expiresAt < Date.now())
     return res.json({ success: false, message: 'key_expired', plan: rec.plan });
-  }
 
-  return res.json({
-    success:   true,
-    message:   'valid',
-    plan:      rec.plan,
-    expiresAt: rec.expiresAt || null
-  });
+  return res.json({ success: true, message: 'valid', plan: rec.plan, expiresAt: rec.expiresAt || null });
 });
 
 /* ═══════════════════════════════════
-   ROTA: POST /api/reset-hwid  [ADMIN]
+   ROTA: POST /api/reset-hwid [ADMIN]
 ═══════════════════════════════════ */
-app.post('/api/reset-hwid', requireAdmin, (req, res) => {
+app.post('/api/reset-hwid', requireAdmin, async (req, res) => {
   const { key } = req.body;
   if (!key) return res.status(400).json({ success: false, message: 'key é obrigatória' });
 
-  const db  = loadDB();
-  const rec = db.active.find(a => a.code === key.toUpperCase().trim());
+  const rec = await active().findOne({ code: key.toUpperCase().trim() });
   if (!rec) return res.json({ success: false, message: 'key não encontrada' });
 
-  rec.hwid    = null;
-  rec.resetAt = new Date().toISOString();
-  saveDB(db);
+  await active().updateOne({ _id: rec._id }, { $set: { hwid: null, resetAt: new Date().toISOString() } });
   return res.json({ success: true, message: 'hwid_reset' });
 });
 
 /* ═══════════════════════════════════
-   ROTA: POST /api/generate  [ADMIN]
+   ROTA: POST /api/generate [ADMIN]
 ═══════════════════════════════════ */
-app.post('/api/generate', requireAdmin, (req, res) => {
+app.post('/api/generate', requireAdmin, async (req, res) => {
   const { plan, qty, prefix } = req.body;
   const plans = ['Diario','Semanal','Mensal','Vitalicio'];
-  if (!plans.includes(plan)) return res.status(400).json({ success: false, message: 'plano inválido' });
+  if (!plans.includes(plan))
+    return res.status(400).json({ success: false, message: 'plano inválido' });
 
   const amount = Math.min(100, Math.max(1, parseInt(qty) || 1));
-  const db     = loadDB();
-  if (!db.keys) db.keys = { Diario: [], Semanal: [], Mensal: [], Vitalicio: [] };
-
   const generated = [];
+  const docs = [];
+
   for (let i = 0; i < amount; i++) {
     const code = generateKeyCode(prefix || 'KEY');
-    const entry = { id: uid(), code };
-    db.keys[plan].push(entry);
+    docs.push({ id: uid(), plan, code });
     generated.push(code);
   }
-  saveDB(db);
+
+  await keys().insertMany(docs);
   return res.json({ success: true, generated, count: generated.length });
 });
 
 /* ═══════════════════════════════════
-   ROTA: GET /api/keys  [ADMIN]
+   ROTA: GET /api/keys [ADMIN]
 ═══════════════════════════════════ */
-app.get('/api/keys', requireAdmin, (req, res) => {
-  const db = loadDB();
-  return res.json({ success: true, keys: db.keys || {}, active: db.active || [] });
+app.get('/api/keys', requireAdmin, async (req, res) => {
+  const allKeys   = await keys().find({}).toArray();
+  const allActive = await active().find({}).toArray();
+
+  const grouped = { Diario: [], Semanal: [], Mensal: [], Vitalicio: [] };
+  allKeys.forEach(k => {
+    if (grouped[k.plan]) grouped[k.plan].push({ id: k.id, code: k.code });
+  });
+
+  // Remove _id do MongoDB antes de enviar pro frontend
+  const cleanActive = allActive.map(({ _id, ...rest }) => rest);
+
+  return res.json({ success: true, keys: grouped, active: cleanActive });
 });
 
 /* ═══════════════════════════════════
-   ROTA: DELETE /api/keys/:id  [ADMIN]
+   ROTA: DELETE /api/keys/pending/:plan [ADMIN]
+   (deve vir ANTES de /api/keys/:id)
 ═══════════════════════════════════ */
-app.delete('/api/keys/:id', requireAdmin, (req, res) => {
-  const db  = loadDB();
-  const idx = (db.active || []).findIndex(a => a.id === req.params.id);
-  if (idx === -1) return res.json({ success: false, message: 'key não encontrada' });
-  db.active.splice(idx, 1);
-  saveDB(db);
+app.delete('/api/keys/pending/:plan', requireAdmin, async (req, res) => {
+  const valid = ['Diario','Semanal','Mensal','Vitalicio'];
+  if (!valid.includes(req.params.plan))
+    return res.status(400).json({ success: false, message: 'plano inválido' });
+
+  const result = await keys().deleteMany({ plan: req.params.plan });
+  return res.json({ success: true, removed: result.deletedCount });
+});
+
+/* ═══════════════════════════════════
+   ROTA: DELETE /api/keys/pending/:plan/:id [ADMIN]
+═══════════════════════════════════ */
+app.delete('/api/keys/pending/:plan/:id', requireAdmin, async (req, res) => {
+  const valid = ['Diario','Semanal','Mensal','Vitalicio'];
+  if (!valid.includes(req.params.plan))
+    return res.status(400).json({ success: false, message: 'plano inválido' });
+
+  const result = await keys().deleteOne({ plan: req.params.plan, id: req.params.id });
+  return res.json({ success: true, removed: result.deletedCount });
+});
+
+/* ═══════════════════════════════════
+   ROTA: DELETE /api/keys/:id [ADMIN]
+═══════════════════════════════════ */
+app.delete('/api/keys/:id', requireAdmin, async (req, res) => {
+  const result = await active().deleteOne({ id: req.params.id });
+  if (result.deletedCount === 0)
+    return res.json({ success: false, message: 'key não encontrada' });
   return res.json({ success: true, message: 'key_deleted' });
 });
 
 /* ═══════════════════════════════════
-   ROTA: POST /api/add-time  [ADMIN]
+   ROTA: POST /api/add-time [ADMIN]
 ═══════════════════════════════════ */
-app.post('/api/add-time', requireAdmin, (req, res) => {
+app.post('/api/add-time', requireAdmin, async (req, res) => {
   const { id, amt, unit } = req.body;
-  if (!id || !amt) return res.status(400).json({ success: false, message: 'id e amt obrigatórios' });
-  const db  = loadDB();
-  const rec = (db.active || []).find(a => a.id === id);
+  if (!id || !amt)
+    return res.status(400).json({ success: false, message: 'id e amt obrigatórios' });
+
+  const rec = await active().findOne({ id });
   if (!rec) return res.json({ success: false, message: 'key não encontrada' });
   if (rec.plan === 'Vitalicio') return res.json({ success: false, message: 'key vitalícia' });
-  const ms = unit === 'hour' ? amt * 3600000 : amt * 86400000;
-  rec.expiresAt = Math.max(Date.now(), rec.expiresAt || Date.now()) + ms;
-  saveDB(db);
-  return res.json({ success: true, message: 'time_added', expiresAt: rec.expiresAt });
-});
 
-/* ═══════════════════════════════════════
-   ROTA: DELETE /api/keys/pending/:plan  [ADMIN]
-═══════════════════════════════════════ */
-app.delete('/api/keys/pending/:plan', requireAdmin, (req, res) => {
-  const db = loadDB();
-  const valid = ['Diario','Semanal','Mensal','Vitalicio'];
-  if (!valid.includes(req.params.plan))
-    return res.status(400).json({ success: false, message: 'plano inválido' });
-  db.keys[req.params.plan] = [];
-  saveDB(db);
-  return res.json({ success: true, message: 'keys_cleared' });
-});
+  const ms        = unit === 'hour' ? amt * 3600000 : amt * 86400000;
+  const expiresAt = Math.max(Date.now(), rec.expiresAt || Date.now()) + ms;
 
-/* ═══════════════════════════════════════
-   ROTA: DELETE /api/keys/pending/:plan/:id  [ADMIN]
-═══════════════════════════════════════ */
-app.delete('/api/keys/pending/:plan/:id', requireAdmin, (req, res) => {
-  const db = loadDB();
-  const valid = ['Diario','Semanal','Mensal','Vitalicio'];
-  if (!valid.includes(req.params.plan))
-    return res.status(400).json({ success: false, message: 'plano inválido' });
-  const before = db.keys[req.params.plan].length;
-  db.keys[req.params.plan] = db.keys[req.params.plan].filter(k => k.id !== req.params.id);
-  saveDB(db);
-  return res.json({ success: true, removed: before - db.keys[req.params.plan].length });
+  await active().updateOne({ id }, { $set: { expiresAt } });
+  return res.json({ success: true, message: 'time_added', expiresAt });
 });
 
 /* ═══════════════════════════════════
@@ -337,19 +301,18 @@ app.get('/api/health', (req, res) => {
   res.json({ success: true, message: 'ok', ts: Date.now() });
 });
 
-app.listen(PORT, () => {
-  console.log(`\n╔══════════════════════════════════╗`);
-  console.log(`║  KEY AUTH API rodando na :${PORT}   ║`);
-  console.log(`╚══════════════════════════════════╝\n`);
-  console.log(`  Admin Secret : ${ADMIN_SECRET}`);
-  console.log(`  DB File      : ${DB_FILE}\n`);
-  console.log(`  Endpoints:`);
-  console.log(`    POST   /api/activate`);
-  console.log(`    POST   /api/verify`);
-  console.log(`    POST   /api/reset-hwid  [admin]`);
-  console.log(`    POST   /api/generate    [admin]`);
-  console.log(`    GET    /api/keys        [admin]`);
-  console.log(`    DELETE /api/keys/:id    [admin]`);
-  console.log(`    DELETE /api/keys/pending/:plan      [admin]`);
-  console.log(`    DELETE /api/keys/pending/:plan/:id  [admin]\n`);
+/* ═══════════════════════════════════
+   START
+═══════════════════════════════════ */
+connectDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`\n╔══════════════════════════════════╗`);
+    console.log(`║  KEY AUTH API rodando na :${PORT}   ║`);
+    console.log(`╚══════════════════════════════════╝\n`);
+    console.log(`  Admin Secret : ${ADMIN_SECRET}`);
+    console.log(`  MongoDB      : conectado\n`);
+  });
+}).catch(err => {
+  console.error('Falha ao conectar no MongoDB:', err);
+  process.exit(1);
 });
